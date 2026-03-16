@@ -1,0 +1,711 @@
+#include <Wire.h>
+#include <MPU6050.h>
+#include <math.h>
+#include <VL53L1X.h>
+#include <I2Cdev.h>
+#include <Servo.h>
+
+// ===== Distance sensor =====
+VL53L1X sensorDist;
+#define XSHUT_CENTER 39
+
+// ====== Servo ========
+Servo servo;
+int pos = 0;
+
+// ===== Button pin =====
+#define BTN_PIN 11
+
+// ===== BUZZER pin =====
+#define BUZZER_PIN  A7
+
+// ===== MPU6050 gyroscope =====
+MPU6050 mpu; // (0x69);
+float gyroZ_offset = 0;
+float totalGyroZ = 0;
+bool trackingRotation = false;
+unsigned long lastTime = 0;
+
+// ===== CNC Shield motor control pins =====
+const byte enablePin = 8;
+// left-front Z
+// left-rear X
+// right-front Y
+// right-rear A
+const int StepX = 2, DirX = 5;
+const int StepY = 3, DirY = 6;
+const int StepZ = 4, DirZ = 7;
+const int StepA = 12, DirA = 13;
+const int detPin = 16;
+
+// ===== Motion constants =====
+const float STEPS_PER_MM = 9.67;
+const float STEPS_PER_DEGREE = 10;
+const float TURN_CORRECTION_K = 0.98930;
+
+enum ChassisDirection { FORWARD, BACKWARD, LEFT, RIGHT };
+enum Diagonal { FORWARD_RIGHT, FORWARD_LEFT };
+int current_half_period = 500;  // half-period: 100 is the minimum number; fastest.
+
+// ===== Distance measurement results =====
+int distanceRear, distanceLeft, distanceRight;
+
+// ===== IMU data streaming =====
+unsigned long lastImuUpdate = 0;
+const unsigned long IMU_UPDATE_INTERVAL = 200; // 200ms = 5Hz update rate
+
+long totalStepsX = 0;
+long totalStepsY = 0;
+bool isMoving = false;
+int currentMoveDirection = FORWARD;
+
+// ?? Inertial detection logic ??
+const float MOTION_THRESHOLD = 1.0;
+unsigned long stationary_time = 0;
+bool was_stationary = false;
+
+// ?? Raw data accumulation for dynamic offset estimation ??
+long  biasAccumulatorRaw = 0;
+int   biasCountRaw = 0;
+
+// Limit switch pins
+const int limitSwitch = 19;//31;
+
+//Line Tracking IO define
+// Right, middle, left sensors
+#define LT_R !digitalRead(16)
+#define LT_M !digitalRead(17)
+#define LT_L !digitalRead(18)
+
+#define ENA 5 //Enable
+#define ENB 6
+#define IN1 7 //IR Sensors
+#define IN2 8
+#define IN3 9
+#define IN4 11
+
+#define carSpeed 150
+
+//IGNORE - DC MOTOR CONTROL
+
+void forward() {
+  analogWrite(ENA, carSpeed);
+  analogWrite(ENB, carSpeed);
+  digitalWrite(IN1, HIGH);    // HIGH = BLACK
+  digitalWrite(IN2, LOW);     // LOW = WHITE
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  Serial.println("go forward!");
+}
+
+void back() {
+  analogWrite(ENA, carSpeed);
+  analogWrite(ENB, carSpeed);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  Serial.println("go back!");
+}
+
+void left() {
+  analogWrite(ENA, carSpeed);
+  analogWrite(ENB, carSpeed);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  Serial.println("go left!");
+}
+
+void right() {
+  analogWrite(ENA, carSpeed);
+  analogWrite(ENB, carSpeed);
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  Serial.println("go right!");
+}
+
+void stop() {
+  digitalWrite(ENA, LOW);
+  digitalWrite(ENB, LOW);
+  Serial.println("Stop!");
+}
+
+void calibrateGyroZ(int samples = 200) {
+  long sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += mpu.getRotationZ();
+    delay(5);
+  }
+  gyroZ_offset = sum / (float)samples;
+  Serial.print("gyroZ_offset = ");
+  Serial.println(gyroZ_offset);
+}
+
+void trackRotationStart();
+void trackRotationUpdate();
+void trackRotationStop();
+float normalizeAngle(float angle);
+float getYaw();
+void sendImuUpdate();
+void setChassisMovementDirection(int dir);
+void moveChassisDir(int dir, float mm, int half_period_target);
+void moveChassisSideways(int dir, float mm, int half_period);
+void turnLeftWithMPU(float targetDegrees, int half_period_target);
+void turnRightWithMPU(float targetDegrees, int half_period_target);
+void initializeDistanceSensor();
+void measureDistances();
+void processChassisCommand(String cmd);
+
+// =======================
+// True sweep search + small forward creep during sweep
+// =======================
+enum RobotMode { MODE_FOLLOW, MODE_SWEEP_SEARCH };
+RobotMode mode = MODE_FOLLOW;
+
+const float MAX_SWEEP_DEG = 60.0;        // sweep limit to one side
+const int   SWEEP_HALF_PERIOD = 1200;    // slower turn while searching
+
+// NEW: small forward movement during sweeping to help reacquire on bends
+const float SWEEP_CREEP_MM = 0.75;         // move forward slightly after each sweep chunk
+const int   SWEEP_CREEP_HALF_PERIOD = 800;
+
+const float FORWARD_CREEP_MM = 1;      // fallback creep if both sweeps fail
+const int   FORWARD_CREEP_HALF_PERIOD = 800;
+
+bool lineDetected() {
+  // Reacquired if ANY sensor sees the line again
+  return (!LT_M) || (!LT_L) || (!LT_R);
+}
+
+// Helper: sweep in dir, but check sensors while sweeping.
+// NEW: after each turn chunk, creep forward 2 mm (unless we already found the line)
+bool sweepTurnAndCheck(int dirSign, float totalDeg) {
+  // dirSign: -1 = left, +1 = right
+  const float CHUNK_DEG = 3.0;
+  float turned = 0.0;
+
+  while (turned < totalDeg) {
+    if (lineDetected()) return true;
+
+    float stepDeg = min(CHUNK_DEG, totalDeg - turned);
+    if (dirSign < 0) turnLeftWithMPU(stepDeg * TURN_CORRECTION_K, SWEEP_HALF_PERIOD);
+    else             turnRightWithMPU(stepDeg * TURN_CORRECTION_K, SWEEP_HALF_PERIOD);
+
+    turned += stepDeg;
+
+    if (lineDetected()) return true;
+
+    // NEW: slight forward creep to help re-find line on bends
+    moveChassisDir(FORWARD, SWEEP_CREEP_MM, SWEEP_CREEP_HALF_PERIOD);
+
+    if (lineDetected()) return true;
+  }
+  return lineDetected();
+}
+
+void startSweepSearchFromLastDirection() {
+  mode = MODE_SWEEP_SEARCH;
+}
+
+int lastDirection = 100;
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(LT_R, INPUT);
+  pinMode(LT_M, INPUT);
+  pinMode(LT_L, INPUT);
+
+  Wire.begin();
+  Wire.setClock(400000);
+  while (!Serial);
+  while (Serial.available()) Serial.read();
+
+  // Initialize MPU6050
+  mpu.initialize();
+  if (mpu.testConnection()) {
+    Serial.println("MPU6050 connected");
+    calibrateGyroZ();
+  } else {
+    Serial.println("MPU6050 DEAD");
+  }
+
+  // Initialize motor control pins
+  pinMode(enablePin, OUTPUT); digitalWrite(enablePin, LOW);
+  pinMode(detPin, INPUT); digitalWrite(detPin, HIGH);
+  pinMode(StepX, OUTPUT); pinMode(DirX, OUTPUT);
+  pinMode(StepY, OUTPUT); pinMode(DirY, OUTPUT);
+  pinMode(StepZ, OUTPUT); pinMode(DirZ, OUTPUT);
+  pinMode(StepA, OUTPUT); pinMode(DirA, OUTPUT);
+  pinMode(BTN_PIN, INPUT_PULLUP);
+
+  trackRotationStart();
+
+  // Initialize distance sensor
+  initializeDistanceSensor();
+
+  // Servo
+  servo.attach(27);
+  servo.write(60);
+  servo.write(90);
+
+  //Limit switch
+  pinMode(limitSwitch, INPUT_PULLUP);
+}
+
+void loop() {
+  Serial.println("LOOP");
+  trackRotationUpdate();
+
+  if (!LT_M) {        // if M  = 0 (white), move forward
+    mode = MODE_FOLLOW;
+    Serial.println("FORWARD");
+    moveChassisDir(FORWARD, 5, 500);
+    lastDirection = 0;
+  }
+  else if (!LT_R) { // if the right sensor detects line, turn right
+    mode = MODE_FOLLOW;
+    Serial.println("RIGHT");
+    turnRightWithMPU(1 * TURN_CORRECTION_K, 500);
+    lastDirection = +1;
+  }
+  else if (!LT_L) { // if the left sensor detects line, turn right
+    mode = MODE_FOLLOW;
+    Serial.println("LEFT");
+    turnLeftWithMPU(1 * TURN_CORRECTION_K, 500);
+    lastDirection = -1;
+  }
+  else {
+    // ===== LOST LINE: TRUE SWEEP SEARCH =====
+    if (mode != MODE_SWEEP_SEARCH) {
+      Serial.println("LOST LINE -> START SWEEP SEARCH");
+      startSweepSearchFromLastDirection();
+    }
+
+    // Decide initial sweep direction from lastDirection
+    // lastDirection: -1 = last saw left, +1 = last saw right, 0 = straight
+    int primaryDir = +1; // default right
+    if (lastDirection == -1) primaryDir = -1;
+    else if (lastDirection == +1) primaryDir = +1;
+
+    // 1) Sweep toward the last known side
+    Serial.println("SWEEP 1...");
+    bool found = sweepTurnAndCheck(primaryDir, MAX_SWEEP_DEG);
+    if (found) {
+      Serial.println("LINE REACQUIRED (SWEEP 1)!");
+      mode = MODE_FOLLOW;
+      return;
+    }
+
+    // 2) Sweep back past center to the other side
+    Serial.println("SWEEP 2...");
+    found = sweepTurnAndCheck(-primaryDir, 2.0 * MAX_SWEEP_DEG);
+    if (found) {
+      Serial.println("LINE REACQUIRED (SWEEP 2)!");
+      mode = MODE_FOLLOW;
+      return;
+    }
+
+    // 3) Fallback: creep forward a bit and try again next loop
+    Serial.println("SWEEP FAILED -> CREEP FORWARD");
+    moveChassisDir(FORWARD, FORWARD_CREEP_MM, FORWARD_CREEP_HALF_PERIOD);
+
+    // stay in MODE_SWEEP_SEARCH and repeat
+  }
+}
+
+void trackRotationStart() {
+  totalGyroZ = 0;
+  lastTime = millis();
+  trackingRotation = true;
+}
+
+void trackRotationUpdate() {
+  if (!trackingRotation) return;
+
+  unsigned long now = millis();
+  float dt = (now - lastTime) / 1000.0;
+  lastTime = now;
+
+  // 1) Read raw gyroscope values
+  int16_t gz_raw = mpu.getRotationZ();
+
+  // 2) Convert to ï¿½/s
+  float rate = (gz_raw - gyroZ_offset) / 131.0;
+
+  // ?? Stationary detection and raw data accumulation ??
+  if (abs(rate) < MOTION_THRESHOLD) {
+    if (!was_stationary) {
+      was_stationary = true;
+      stationary_time = now;
+      biasAccumulatorRaw = 0;
+      biasCountRaw = 0;
+    }
+    biasAccumulatorRaw += gz_raw;
+    biasCountRaw++;
+
+    if (now - stationary_time > 3000 && biasCountRaw > 0) {
+      gyroZ_offset = biasAccumulatorRaw / biasCountRaw;
+      stationary_time = now;
+      biasAccumulatorRaw = 0;
+      biasCountRaw = 0;
+    }
+    return;
+  }
+  was_stationary = false;
+
+  totalGyroZ += rate * dt;
+}
+
+/**
+ * Serial commands?F/B/SL/SR/ML/MR?
+ */
+void processChassisCommand(String cmd) {
+  if (cmd.startsWith("V")) {
+    current_half_period = cmd.substring(1).toInt();
+    Serial.print("Speed set: half_period = ");
+    Serial.print(current_half_period);
+    Serial.println(" us");
+  }
+  else if (cmd.startsWith("F")) {
+    int dist = cmd.substring(1).toInt();
+    moveChassisDir(FORWARD, dist, current_half_period);
+  }
+  else if (cmd.startsWith("B")) {
+    int dist = cmd.substring(1).toInt();
+    moveChassisDir(BACKWARD, dist, current_half_period);
+  }
+  else if (cmd.startsWith("SL")) {
+    int dist = cmd.substring(2).toInt();
+    moveChassisSideways(LEFT, dist, current_half_period);
+  }
+  else if (cmd.startsWith("SR")) {
+    int dist = cmd.substring(2).toInt();
+    moveChassisSideways(RIGHT, dist, current_half_period);
+  }
+  else if (cmd.startsWith("ML")) {
+    int angle = cmd.substring(2).toInt();
+    turnLeftWithMPU(angle * TURN_CORRECTION_K, 100);
+  }
+  else if (cmd.startsWith("MR")) {
+    int angle = cmd.substring(2).toInt();
+    turnRightWithMPU(angle * TURN_CORRECTION_K, 100);
+  }
+  else if (cmd == "YAW") {
+    Serial.print("IMU_YAW=");
+    Serial.println(getYaw());
+  }
+  else if (cmd == "SCAN") {
+    measureDistances();
+  }
+  else if (cmd == "S") {
+    Serial.println("DONE");
+  }
+  else {
+    Serial.println("?");
+  }
+}
+
+float normalizeAngle(float angle) {
+  angle = fmod(angle, 360.0);
+  if (angle > 180.0)  angle -= 360.0;
+  if (angle <= -180.0) angle += 360.0;
+  return angle;
+}
+
+void trackRotationStop() {
+  trackingRotation = false;
+  int roundedAngle = round(totalGyroZ);
+}
+
+void resetYaw() {
+  totalGyroZ = 0;
+  Serial.println("IMU yaw reset to 0.");
+}
+
+void sendImuUpdate() {
+  Serial.print("IMU:");
+  Serial.println(getYaw());
+}
+
+// === Chassis movement functions ===
+void moveChassisDir(int dir, float mm, int half_period_target) {
+  unsigned long t0 = millis();
+
+  int steps = round(mm * STEPS_PER_MM);
+  Serial.print("Moving dir="); Serial.print(dir);
+  Serial.print("  mm="); Serial.print(mm);
+  Serial.print(" -> steps="); Serial.println(steps);
+
+  int accel_steps = max((int)(steps * 0.05), 10);
+  int decel_start = steps - accel_steps;
+  int start_period = half_period_target * 2;
+  int current_period;
+
+  setChassisMovementDirection(dir);
+
+  for (int i = 0; i < steps; i++) {
+    if (i < accel_steps) {
+      current_period = start_period - (start_period - half_period_target) * i / accel_steps;
+    }
+    else if (i >= decel_start) {
+      int j = i - decel_start;
+      current_period = half_period_target + (start_period - half_period_target) * j / accel_steps;
+    }
+    else {
+      current_period = half_period_target;
+    }
+
+    digitalWrite(StepX, HIGH); digitalWrite(StepY, HIGH);
+    digitalWrite(StepZ, HIGH); digitalWrite(StepA, HIGH);
+    delayMicroseconds(current_period);
+    digitalWrite(StepX, LOW);  digitalWrite(StepY, LOW);
+    digitalWrite(StepZ, LOW);  digitalWrite(StepA, LOW);
+    delayMicroseconds(current_period);
+
+    // === Bump detection; Limit Switch ====
+    bool Bump = digitalRead(limitSwitch) == LOW;
+    if (Bump) {
+      Serial.println("BUMP detected! Stopping and retreating.");
+
+      if (dir == FORWARD) setChassisMovementDirection(BACKWARD);
+      else               setChassisMovementDirection(FORWARD);
+
+      int retreatSteps = round(100 * STEPS_PER_MM);
+      for (int k = 0; k < retreatSteps; k++) {
+        digitalWrite(StepX, HIGH);
+        digitalWrite(StepY, HIGH);
+        digitalWrite(StepZ, HIGH); digitalWrite(StepA, HIGH);
+        delayMicroseconds(half_period_target);
+        digitalWrite(StepX, LOW);  digitalWrite(StepY, LOW);
+        digitalWrite(StepZ, LOW);  digitalWrite(StepA, LOW);
+        delayMicroseconds(half_period_target);
+      }
+
+      unsigned long dt = millis() - t0;
+      Serial.print("TIME_MS:"); Serial.println(dt);
+      Serial.println("DONE");
+      return;
+    }
+  }
+
+  unsigned long dt = millis() - t0;
+  Serial.print("TIME_MS:"); Serial.println(dt);
+  Serial.println("DONE");
+}
+
+void setChassisMovementDirection(int dir) {
+  currentMoveDirection = dir;
+
+  switch (dir) {
+    case FORWARD:
+      digitalWrite(DirX, HIGH); digitalWrite(DirY, LOW);
+      digitalWrite(DirZ, HIGH); digitalWrite(DirA, LOW); break;
+    case BACKWARD:
+      digitalWrite(DirX, LOW); digitalWrite(DirY, HIGH);
+      digitalWrite(DirZ, LOW); digitalWrite(DirA, HIGH); break;
+    case LEFT:
+      digitalWrite(DirX, LOW); digitalWrite(DirY, LOW);
+      digitalWrite(DirZ, HIGH); digitalWrite(DirA, HIGH); break;
+    case RIGHT:
+      digitalWrite(DirX, HIGH); digitalWrite(DirY, HIGH);
+      digitalWrite(DirZ, HIGH); digitalWrite(DirA, HIGH); break;
+  }
+}
+
+// Perform in-place left turn using MPU6050 with IMU feedback
+void turnLeftWithMPU(float targetDegrees, int half_period_target) {
+  unsigned long t0 = millis();
+  trackRotationStart();
+  totalGyroZ = 0;
+  lastTime = millis();
+  lastImuUpdate = millis();
+
+  digitalWrite(DirX, LOW);
+  digitalWrite(DirY, LOW);
+  digitalWrite(DirZ, LOW);
+  digitalWrite(DirA, LOW);
+
+  const int pulse_interval = half_period_target;
+
+  while (abs(totalGyroZ) < abs(targetDegrees)) {
+    digitalWrite(StepX, HIGH);
+    digitalWrite(StepY, HIGH);
+    digitalWrite(StepZ, HIGH);
+    digitalWrite(StepA, HIGH);
+    delayMicroseconds(pulse_interval);
+    digitalWrite(StepX, LOW);
+    digitalWrite(StepY, LOW);
+    digitalWrite(StepZ, LOW);
+    digitalWrite(StepA, LOW);
+    delayMicroseconds(pulse_interval);
+
+    trackRotationUpdate();
+    if (millis() - lastImuUpdate >= IMU_UPDATE_INTERVAL) {
+      sendImuUpdate();
+      lastImuUpdate = millis();
+    }
+  }
+
+  trackRotationStop();
+  unsigned long dt = millis() - t0;
+  Serial.print("TIME_MS:"); Serial.println(dt);
+  Serial.println("DONE");
+}
+
+// Use MPU6050 to perform an in-place right turn with IMU feedback
+void turnRightWithMPU(float targetDegrees, int half_period_target) {
+  unsigned long t0 = millis();
+
+  trackRotationStart();
+  totalGyroZ = 0;
+  lastTime = millis();
+  lastImuUpdate = millis();
+
+  digitalWrite(DirX, HIGH);
+  digitalWrite(DirY, HIGH);
+  digitalWrite(DirZ, HIGH);
+  digitalWrite(DirA, HIGH);
+
+  const int pulse_interval = half_period_target;
+
+  while (abs(totalGyroZ) < abs(targetDegrees)) {
+    digitalWrite(StepX, HIGH); digitalWrite(StepY, HIGH);
+    digitalWrite(StepZ, HIGH); digitalWrite(StepA, HIGH);
+    delayMicroseconds(pulse_interval);
+    digitalWrite(StepX, LOW);  digitalWrite(StepY, LOW);
+    digitalWrite(StepZ, LOW);  digitalWrite(StepA, LOW);
+    delayMicroseconds(pulse_interval);
+
+    trackRotationUpdate();
+
+    if (millis() - lastImuUpdate >= IMU_UPDATE_INTERVAL) {
+      sendImuUpdate();
+      lastImuUpdate = millis();
+    }
+  }
+
+  trackRotationStop();
+
+  unsigned long dt = millis() - t0;
+  Serial.print("TIME_MS:"); Serial.println(dt);
+  Serial.println("DONE");
+}
+
+// Move side ways
+void moveChassisSideways(int dir, float mm, int half_period) {
+  unsigned long t0 = millis();
+
+  int steps = round(mm * STEPS_PER_MM);
+  Serial.print("Sideways dir="); Serial.print(dir == LEFT ? "LEFT" : "RIGHT");
+  Serial.print("  mm="); Serial.print(mm);
+  Serial.print(" -> steps="); Serial.println(steps);
+
+  int accel_steps  = max(steps / 10, 10);
+  int decel_start  = steps - accel_steps;
+  int start_period = half_period * 2;
+  int current_period;
+
+  if (dir == LEFT) {
+    digitalWrite(DirX, LOW);
+    digitalWrite(DirY, HIGH);
+    digitalWrite(DirZ, HIGH);
+    digitalWrite(DirA, LOW);
+  } else { // RIGHT
+    digitalWrite(DirX, HIGH);
+    digitalWrite(DirY, LOW);
+    digitalWrite(DirZ, LOW);
+    digitalWrite(DirA, HIGH);
+  }
+
+  for (int i = 0; i < steps; i++) {
+    if (i < accel_steps) {
+      current_period = start_period - (start_period - half_period) * i / accel_steps;
+    }
+    else if (i >= decel_start) {
+      int j = i - decel_start;
+      current_period = half_period + (start_period - half_period) * j / accel_steps;
+    }
+    else {
+      current_period = half_period;
+    }
+
+    digitalWrite(StepX, LOW);  digitalWrite(StepY, LOW);
+    digitalWrite(StepZ, LOW);  digitalWrite(StepA, LOW);
+    delayMicroseconds(current_period);
+    digitalWrite(StepX, HIGH); digitalWrite(StepY, HIGH);
+    digitalWrite(StepZ, HIGH); digitalWrite(StepA, HIGH);
+    delayMicroseconds(current_period);
+  }
+
+  unsigned long dt = millis() - t0;
+  Serial.print("TIME_MS:"); Serial.println(dt);
+  Serial.println("DONE");
+}
+
+// IMU Yaw value:
+float getYaw() {
+  return -normalizeAngle(totalGyroZ);
+}
+
+void initializeDistanceSensor() {
+  pinMode(XSHUT_CENTER, OUTPUT);
+  digitalWrite(XSHUT_CENTER, LOW);
+
+  digitalWrite(XSHUT_CENTER, HIGH);
+
+  delay(10);
+  if (sensorDist.init()) {
+    sensorDist.setAddress(0x30);
+    sensorDist.setDistanceMode(VL53L1X::Medium);
+    sensorDist.setMeasurementTimingBudget(50000);
+    sensorDist.startContinuous(50);
+    Serial.println("CENTER sensor initialized at 0x31");
+  } else {
+    Serial.println("CENTER sensor init FAILED");
+  }
+}
+
+// === Distance scanning functions ===
+void measureDistances() {
+  unsigned long t0 = millis();
+
+  servo.write(25);
+  delay(1000);
+  distanceLeft  = sensorDist.read();
+  if (sensorDist.timeoutOccurred()) {
+    Serial.println("LEFT sensor TIMEOUT");
+    distanceLeft = 0;
+  }
+
+  servo.write(90);
+  delay(1000);
+  distanceRear  = sensorDist.read();
+  if (sensorDist.timeoutOccurred()) {
+    Serial.println("CENTER sensor TIMEOUT");
+    distanceRear = 0;
+  }
+
+  servo.write(155);
+  delay(1000);
+  distanceRight = sensorDist.read();
+  if (sensorDist.timeoutOccurred()) {
+    Serial.println("RIGHT sensor TIMEOUT");
+    distanceRight = 0;
+  }
+
+  Serial.print("SCAN_RESULT:L="); Serial.println(distanceLeft);
+  Serial.print("SCAN_RESULT:C="); Serial.println(distanceRear);
+  Serial.print("SCAN_RESULT:R="); Serial.println(distanceRight);
+  Serial.print("IMU_YAW="); Serial.println(getYaw());
+
+  Serial.print("TIME_MS:"); Serial.println(millis() - t0);
+  Serial.println("DONE");
+  servo.write(90);
+}
+
