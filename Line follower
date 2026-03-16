@@ -1,0 +1,132 @@
+#include <Wire.h>
+#include <VL53L0X.h>
+#include <Servo.h>
+
+VL53L0X distanceSensor;
+Servo myServo;
+
+#define BTN_PIN 11
+
+const float STEPS_PER_MM = 9.67;
+
+// Motor pins
+const byte enablePin = 8;
+const int StepX = 2, DirX = 5;
+const int StepY = 3, DirY = 6;
+const int StepZ = 4, DirZ = 7;
+const int StepA = 12, DirA = 13;
+
+// Your Mega line sensor pins (digital)
+const int PIN_L = 50;
+const int PIN_M = 44;
+const int PIN_R = 32;
+
+// Set true if your sensor reads HIGH on black
+const bool INVERT = false;
+
+int currentMoveDirection;
+
+enum ChassisDirection { FORWARD, BACKWARD, LEFT, RIGHT, TLEFT, TRIGHT };
+
+bool isBlack(int digitalValue) {
+  return INVERT ? (digitalValue == HIGH) : (digitalValue == LOW);
+}
+
+void setChassisMovementDirection(int dir) {
+  currentMoveDirection = dir;
+  switch (dir) {
+    case FORWARD:
+      digitalWrite(DirX, HIGH); digitalWrite(DirY, LOW);
+      digitalWrite(DirZ, HIGH); digitalWrite(DirA, LOW); break;
+    case BACKWARD:
+      digitalWrite(DirX, LOW);  digitalWrite(DirY, HIGH);
+      digitalWrite(DirZ, LOW);  digitalWrite(DirA, HIGH); break;
+    case LEFT:
+      digitalWrite(DirX, LOW);  digitalWrite(DirY, HIGH);
+      digitalWrite(DirZ, HIGH); digitalWrite(DirA, LOW); break;
+    case RIGHT:
+      digitalWrite(DirX, HIGH); digitalWrite(DirY, LOW);
+      digitalWrite(DirZ, LOW);  digitalWrite(DirA, HIGH); break;
+    case TLEFT:
+      digitalWrite(DirX, HIGH); digitalWrite(DirY, HIGH);
+      digitalWrite(DirZ, LOW);  digitalWrite(DirA, LOW); break;
+    case TRIGHT:
+      digitalWrite(DirX, LOW);  digitalWrite(DirY, LOW);
+      digitalWrite(DirZ, HIGH); digitalWrite(DirA, HIGH); break;
+  }
+}
+
+void moveChassisDir(int dir, float mm, int half_period_us) {
+  int steps = (int)round(mm * STEPS_PER_MM);
+  setChassisMovementDirection(dir);
+
+  for (int i = 0; i < steps; i++) {
+    digitalWrite(StepX, HIGH); digitalWrite(StepY, HIGH);
+    digitalWrite(StepZ, HIGH); digitalWrite(StepA, HIGH);
+    delayMicroseconds(half_period_us);
+    digitalWrite(StepX, LOW);  digitalWrite(StepY, LOW);
+    digitalWrite(StepZ, LOW);  digitalWrite(StepA, LOW);
+    delayMicroseconds(half_period_us);
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  // Motors
+  pinMode(enablePin, OUTPUT);
+  digitalWrite(enablePin, LOW);
+
+  pinMode(StepX, OUTPUT); pinMode(DirX, OUTPUT);
+  pinMode(StepY, OUTPUT); pinMode(DirY, OUTPUT);
+  pinMode(StepZ, OUTPUT); pinMode(DirZ, OUTPUT);
+  pinMode(StepA, OUTPUT); pinMode(DirA, OUTPUT);
+
+  pinMode(BTN_PIN, INPUT_PULLUP);
+
+  // Line sensors
+  pinMode(PIN_L, INPUT);
+  pinMode(PIN_M, INPUT);
+  pinMode(PIN_R, INPUT);
+
+  myServo.attach(10);
+
+  Serial.println("Starting");
+}
+
+void loop() {
+  bool L = isBlack(digitalRead(PIN_L));
+  bool M = isBlack(digitalRead(PIN_M));
+  bool R = isBlack(digitalRead(PIN_R));
+
+  // Debug (optional)
+  Serial.print("L:"); Serial.print(L ? "B" : "W");
+  Serial.print(" M:"); Serial.print(M ? "B" : "W");
+  Serial.print(" R:"); Serial.print(R ? "B" : "W");
+  Serial.print(" -> ");
+
+  // IMPORTANT: small moves, fast updates
+  const float FWD_MM  = 8;
+  const float TURN_MM = 5;
+  const int   SPEED   = 300;
+
+  // Assuming BLACK line on WHITE floor
+  if (M && !L && !R) {
+    Serial.println("STRAIGHT");
+    moveChassisDir(FORWARD, 30, 200);delay(1000);
+  } else if (L && !R) {
+    Serial.println("LEFT");
+    moveChassisDir(RIGHT, 10, 200);delay(1000);
+    moveChassisDir(TRIGHT, 30, 450);delay(1000);
+  } else if (R && !L) {
+    Serial.println("RIGHT");
+    moveChassisDir(LEFT, 10, 200);delay(1000);
+    moveChassisDir(TLEFT, 30, 450);delay(1000);
+  } else if (L && M && R) {
+    moveChassisDir(TRIGHT, 100, 450);delay(1000);
+  } else if (!L && !M && !R) {
+    moveChassisDir(TRIGHT, 4, 450);delay(1000);
+  }
+
+  // No big delay here; keep it responsive
+}
